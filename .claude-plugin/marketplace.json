@@ -1,0 +1,16 @@
+{
+  "name": "seuil",
+  "owner": {
+    "name": "KorroAi"
+  },
+  "metadata": {
+    "description": "Seuil: automatic compaction for Claude Code between turns, above a threshold."
+  },
+  "plugins": [
+    {
+      "name": "seuil",
+      "source": "./",
+      "description": "Automatic compaction between turns, above a threshold."
+    }
+  ]
+}
