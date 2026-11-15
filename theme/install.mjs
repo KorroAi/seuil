@@ -44,11 +44,65 @@ const fingerprint = t => createHash('sha1').update(readFileSync(source(t, 'hlsl'
 const target = (t, ext) => join(installed, t.key, `${t.key}-${fingerprint(t)}.${ext}`)
 const ours = path => String(path ?? '').startsWith(installed)
 
+// Windows Terminal's settings are JSON with comments and trailing commas (its default file has both): strip them,
+// outside strings, before parsing.
+const parseJsonc = source => {
+  // Walks the text outside strings: `keep(i)` says what to do with each character there.
+  const walk = (text, step) => {
+    let out = ''
+
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === '"') {
+        let j = i + 1
+
+        while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1
+        out += text.slice(i, j + 1)
+        i = j
+      } else {
+        const [add, skip] = step(text, i)
+
+        out += add
+        i += skip
+      }
+    }
+
+    return out
+  }
+  const noComments = walk(source.replace(/^﻿/, ''), (text, i) => {
+    if (text.startsWith('//', i)) {
+      const end = text.indexOf('\n', i)
+
+      return ['\n', (end === -1 ? text.length : end) - i]
+    }
+
+    if (text.startsWith('/*', i)) {
+      const end = text.indexOf('*/', i + 2)
+
+      return [' ', (end === -1 ? text.length : end + 2) - i - 1]
+    }
+
+    return [text[i], 0]
+  })
+  const noTrailingCommas = walk(noComments, (text, i) => [text[i] === ',' && /^\s*[}\]]/.test(text.slice(i + 1)) ? '' : text[i], 0])
+
+  return JSON.parse(noTrailingCommas)
+}
+
+// True once the settings read held comments or trailing commas: rewriting them drops those, the copy keeps them.
+let loose = false
+
 const readSettings = () => {
   try {
-    return JSON.parse(readFileSync(settingsFile, 'utf8'))
+    const text = readFileSync(settingsFile, 'utf8')
+
+    try {
+      return JSON.parse(text.replace(/^﻿/, ''))
+    } catch {
+      loose = true
+
+      return parseJsonc(text)
+    }
   } catch (error) {
-    // settings.json may hold comments; then it is left alone rather than rewritten without them.
     console.error(`Could not read Windows Terminal's settings, nothing changed there: ${error.message}`)
 
     return undefined
@@ -89,6 +143,8 @@ const everywhere = theme => {
   // Profiles of themes no longer in the pack, which the terminal kept in memory, go away.
   json.profiles.list = (json.profiles.list ?? []).filter(p => p.source !== 'Seuil' || (theme !== null && THEMES.some(t => t.guid === p.guid)))
   writeFileSync(settingsFile, `${JSON.stringify(json, null, 4)}\n`)
+
+  if (loose) console.log(`Windows Terminal's settings were rewritten without their comments; the original is in ${settingsFile}.before-seuil-theme.`)
 
   return true
 }

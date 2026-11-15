@@ -1,6 +1,6 @@
 {
   "name": "seuil",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Compacts the conversation on its own, between two turns, once it passes a threshold: every call re-reads less, so long sessions cost less.",
   "author": { "name": "KorroAi" },
   "license": "MIT",

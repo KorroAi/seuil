@@ -22,6 +22,11 @@ const MIN_THRESHOLD = 100000
 const WINDOW_SHARE = 0.75
 // One compaction must not trigger the next: the conversation has to grow back by at least half first.
 const REGROWTH = 1.5
+// ...but only after a compaction that could not bring the conversation well under the threshold (a summary still
+// too big). A compaction that worked never blocks the next one: the threshold alone decides again.
+const SHRUNK = 0.8
+// What the engine's size after leaves out (system prompt, tools): added before comparing it to the threshold.
+const OVERHEAD = 40000
 // The engine refuses to compact while a turn is still running: retry for a minute.
 const ATTEMPTS = 30
 const RETRY_MS = 2000
@@ -38,9 +43,11 @@ const INSTRUCTIONS = [
   'Drop tool outputs, images, and the detail of abandoned attempts.',
 ].join('\n')
 
-const USAGE = 'Usage: /seuil (status) · /seuil 250 (threshold in thousands of tokens) · /seuil now · /seuil off · /seuil on'
+const USAGE = '/seuil · /seuil 250 (threshold, in thousands of tokens) · /seuil now · /seuil off · /seuil on'
 
 const compaction = atom({ plugin: 'seuil', key: 'compaction' } as const, null, { shape: 'compaction-2' })
+// The line shown under the prompt. Kept in state: the terminal redraws its hint line as soon as it changes.
+const line = atom({ plugin: 'seuil', key: 'line' } as const, null, { shape: 'line-1' })
 
 let running = false
 let scheduled = false
@@ -52,8 +59,24 @@ let toMeasure = 0
 let readBefore = 0
 // Headless session: known at start, or learned from the engine's first refusal.
 let headless = false
+// On the terminal the line goes at the end of the hint line under the prompt. The plugin status line would draw it
+// as a warning ("⚠seuil: Seuil · …", seen in a real run), so it serves only the other surfaces.
+let terminal = false
+// While a turn of the main conversation runs: refreshes the line.
+let ticker: { cancel: () => void } | undefined
+const TICK_MS = 2000
 
-const k = (tokens: number) => `${Math.round(tokens / 1000)} k`
+/** 98 k, 1.2 M. */
+const k = (tokens: number) => {
+  if (tokens < 999500) {
+    return `${Math.round(tokens / 1000)} k`
+  }
+
+  const millions = tokens / 1000000
+
+  return `${millions >= 9.95 ? Math.round(millions) : Number(millions.toFixed(1))} M`
+}
+const capital = (text: string) => text.charAt(0).toUpperCase() + text.slice(1)
 const count = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
@@ -91,26 +114,45 @@ const effective = (settings: Settings, window: number | undefined) =>
 const describe = (last: Compaction | null) =>
   last === null || last.before === 0 ? undefined : `${k(last.before)}${last.after === undefined ? '' : ` → ${k(last.after)}`}`
 
-const show = async ($: EngineInterface, known?: { tokens: number; window?: number }) => {
+/** Shows `text` under the prompt: in the hint line on the terminal, as the plugin's status line elsewhere. */
+const display = async ($: EngineInterface, text: string) => {
+  if ((await read($, line)) !== text) {
+    await update($, line, () => text)
+  }
+
+  if (!terminal) {
+    $.ui.status(text)
+  }
+}
+
+const show = async ($: EngineInterface) => {
   const settings = await readSettings($)
 
   if (!settings.enabled) {
-    $.ui.status('Seuil · off')
+    await display($, 'Seuil off')
 
     return
   }
 
-  const now = known ?? (await usage($).catch(() => ({ tokens: 0, window: undefined })))
+  const now = await usage($).catch(() => ({ tokens: 0, window: undefined }))
+  const threshold = k(effective(settings, now.window))
   const last = describe(await read($, compaction))
 
-  $.ui.status(`Seuil · ${k(now.tokens)} / ${k(effective(settings, now.window))}${last === undefined ? '' : ` · last compaction ${last}`}`)
+  // Before the first answer (of the session, or after a compaction) the engine does not know the size yet: it reads 0.
+  await display(
+    $,
+    now.tokens === 0
+      ? `Seuil · ${last === undefined ? '' : `last compaction ${last} · `}compacts at ${threshold}`
+      : `Seuil · ${k(now.tokens)} / ${threshold}${last === undefined ? '' : ` · last compaction ${last}`}`,
+  )
 }
 
 /** Records a compaction: the session's state, and for the mod's own ones the counters and the message. */
-const record = async ($: EngineInterface, reason: Compaction['reason'], before: number): Promise<string> => {
+const record = async ($: EngineInterface, reason: Compaction['reason'], before: number, engineAfter?: number): Promise<string> => {
   // The size after is not taken from the engine: its figure leaves out the system prompt and tools (seen in a
-  // real run). It is measured at the end of the next turn, once a real answer has refreshed it.
-  const entry: Compaction = { at: await $.clock.now(), reason, before }
+  // real run). It is measured at the end of the next turn, once a real answer has refreshed it. The engine's
+  // figure is kept anyway: when that next turn is long, the conversation has already grown back by its end.
+  const entry: Compaction = { at: await $.clock.now(), reason, before, ...(typeof engineAfter === 'number' && engineAfter > 0 ? { engineAfter } : {}) }
 
   await update($, compaction, () => entry)
   toMeasure = 2
@@ -123,13 +165,14 @@ const record = async ($: EngineInterface, reason: Compaction['reason'], before: 
 
   await $.store.set('compactions', (await readCounter($, 'compactions')) + 1)
 
-  const text = `Seuil: compacted a ${k(before)} conversation (${reason === 'threshold' ? 'threshold reached' : 'on request'}).`
+  const what = `compacted a ${k(before)} conversation (${reason === 'threshold' ? 'threshold reached' : 'on request'}).`
 
-  $.ui.toast(text, { timeoutMs: 10000 })
+  // The terminal heads a toast with the plugin's name and starts a transcript line with "seuil: ": neither repeats it.
+  $.ui.toast(capital(what), { timeoutMs: 10000 })
   // A line in the transcript too: the trace stays once the toast is gone.
-  $.ui.log(text)
+  $.ui.log(what)
 
-  return text
+  return `Seuil: ${what}`
 }
 
 /**
@@ -162,7 +205,7 @@ const compact = async ($: EngineInterface, reason: Wanted): Promise<string> => {
     const before = await size($)
 
     readBefore = before
-    $.ui.status(`Seuil · compacting (${k(before)})…`)
+    await display($, `Seuil · compacting ${k(before)}…`)
 
     if (headless) {
       return await viaCommand($, reason, before)
@@ -184,25 +227,42 @@ const compact = async ($: EngineInterface, reason: Wanted): Promise<string> => {
     }
 
     if (done.skip !== undefined) {
-      const refused = `Seuil: compaction refused (${done.skip}).`
+      const refused = `Compaction refused (${done.skip}).`
 
       $.ui.toast(refused)
 
-      return refused
+      return `Seuil: ${refused}`
     }
 
-    return await record($, reason, done.tokensBefore ?? before)
+    return await record($, reason, done.tokensBefore ?? before, done.tokensAfter)
   } finally {
     running = false
     await show($).catch(() => undefined)
   }
 }
 
-/** True when the conversation has grown back enough since the last compaction to deserve another. */
-const regrown = async ($: EngineInterface, tokens: number) => {
+/**
+ * True when the conversation has grown back enough since the last compaction to deserve another.
+ * 15/11/2026, bug seen in a real session: the size after a /compact was read at the end of the next turn, a long
+ * autonomous one; the conversation had grown from about 100 k back to 288 k meanwhile. The mod took 288 k for the
+ * result of the compaction and waited for 432 k (288 k × 1.5) while the threshold was 300 k. Now the guard holds only
+ * when the compaction itself left the conversation too big: an "after" larger than the "before" is not a result, and
+ * the engine's own figure (plus what it leaves out) shows whether the compaction worked.
+ */
+const regrown = async ($: EngineInterface, tokens: number, threshold: number) => {
   const last = await read($, compaction)
 
-  return last?.after === undefined || tokens >= last.after * REGROWTH
+  if (last?.after === undefined) {
+    return true
+  }
+
+  const result = Math.min(last.after, last.engineAfter === undefined ? Infinity : last.engineAfter + OVERHEAD)
+
+  if (last.after >= last.before || result < threshold * SHRUNK) {
+    return true
+  }
+
+  return tokens >= last.after * REGROWTH
 }
 
 /** True when the automatic compaction should start now. Checked again right before compacting. */
@@ -210,7 +270,9 @@ const over = async ($: EngineInterface) => {
   const settings = await readSettings($)
   const now = await usage($)
 
-  return settings.enabled && now.tokens >= effective(settings, now.window) && (await regrown($, now.tokens))
+  const threshold = effective(settings, now.window)
+
+  return settings.enabled && now.tokens >= threshold && (await regrown($, now.tokens, threshold))
 }
 
 /** Starts a compaction outside any hook, and retries it while a turn is still running. */
@@ -242,9 +304,9 @@ const launch = ($: EngineInterface, reason: Wanted, attempt = 1) => {
 
         // At the threshold, stay quiet: a new turn has started, and the check runs again when it ends.
         if (reason === 'requested') {
-          const failed = `Seuil: could not compact (${message(error)})`
+          const failed = `could not compact (${message(error)})`
 
-          $.ui.toast(failed, { timeoutMs: 10000 })
+          $.ui.toast(capital(failed), { timeoutMs: 10000 })
           $.ui.log(failed)
         }
       },
@@ -339,14 +401,14 @@ const command = async ($: EngineInterface, args: string): Promise<string> => {
     await $.store.set('settings', { ...settings, enabled: word === 'on' })
     await show($)
 
-    return word === 'on' ? 'Seuil is on.' : 'Seuil is off: no more automatic compaction.'
+    return word === 'on' ? `On: compacts between turns above ${k(settings.threshold)}.` : 'Off: no automatic compaction until /seuil on.'
   }
 
   if (word === 'now' || word === 'maintenant') {
     // Not from the command itself: the engine refuses to compact under the turn the command holds.
     launch($, 'requested')
 
-    return 'Compaction scheduled: it starts as soon as this turn is handed back.'
+    return 'Compaction scheduled: it starts as soon as this turn ends.'
   }
 
   if (/^\d+$/.test(word)) {
@@ -355,11 +417,11 @@ const command = async ($: EngineInterface, args: string): Promise<string> => {
     await $.store.set('settings', { ...settings, threshold })
     await show($)
 
-    return `Threshold set to ${k(threshold)}${threshold !== Number(word) * 1000 ? ` (minimum ${k(MIN_THRESHOLD)})` : ''}.`
+    return `Threshold set to ${k(threshold)}${threshold !== Number(word) * 1000 ? ' (the minimum)' : ''}.`
   }
 
   if (word !== '') {
-    return USAGE
+    return `Usage: ${USAGE}`
   }
 
   const now = await usage($).catch(() => ({ tokens: 0, window: undefined }))
@@ -370,11 +432,12 @@ const command = async ($: EngineInterface, args: string): Promise<string> => {
 
   return [
     settings.enabled
-      ? `Seuil is on: automatic compaction between two turns above ${k(applies)}${applies < settings.threshold ? ` (${k(settings.threshold)} set, lowered to ${Math.round(WINDOW_SHARE * 100)} % of this model's window)` : ''}.`
-      : 'Seuil is off.',
-    `Current conversation: ${k(now.tokens)}.`,
+      ? `On: compacts between turns above ${k(applies)}${applies < settings.threshold ? ` (${k(settings.threshold)} set, lowered to ${Math.round(WINDOW_SHARE * 100)} % of this model's window)` : ''}.`
+      : 'Off: no automatic compaction until /seuil on.',
+    `Conversation now: ${now.tokens === 0 ? 'not measured yet (it is after the first answer)' : k(now.tokens)}.`,
     last === null ? 'No compaction in this session yet.' : `Last compaction: ${describe(last) ?? k(last.before)}.`,
-    `Since install: ${count(done, 'compaction')}, ${k(removed)} removed from the conversation (each would have been re-read on every later call).`,
+    `Since install: ${count(done, 'compaction')}, ${k(removed)} tokens taken out, each of which would have been re-read on every later call.`,
+    `Commands: ${USAGE}`,
   ].join('\n')
 }
 
@@ -396,6 +459,7 @@ export const register: Register = on => {
     })
 
     headless = e.isInteractive === false
+    terminal = e.surface === 'terminal'
 
     const started = await next(e)
 
@@ -405,6 +469,13 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'seuil' }, async ($, e) => ({ text: await command($, e.args) }))
+
+  // The terminal's hint line under the prompt ("? for shortcuts"), with the line added at its end, dim.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const text = e.surface === 'terminal' ? await read($, line).catch(() => null) : null
+
+    return next(text === null ? e : { ...e, props: { ...e.props, tail: text } })
+  })
 
   on('tool.call', { tool: 'mcp__seuil__diagnostic' }, async ($, e) => {
     const input = e as unknown as { compact?: unknown }
@@ -421,15 +492,36 @@ export const register: Register = on => {
       const wanted = expected
 
       expected = undefined
-      await record($, wanted?.reason ?? 'other', done.tokensBefore ?? wanted?.before ?? 0).catch(() => undefined)
+      await record($, wanted?.reason ?? 'other', done.tokensBefore ?? wanted?.before ?? 0, done.tokensAfter).catch(() => undefined)
     }
 
     return done
   })
 
+  // During a turn the line follows the conversation as it grows: a long agentic turn can go far past the threshold
+  // before it ends, and the person sees it happen.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+
+    if (e.agentId === undefined && ticker === undefined) {
+      ticker = $.clock.every(TICK_MS, () => {
+        if (!running && toMeasure === 0) {
+          void show($).catch(() => undefined)
+        }
+      })
+    }
+
+    return started
+  })
+
   // The turn end does not wait: the compaction starts on a timer, outside this hook.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
+
+    if (e.agentId === undefined) {
+      ticker?.cancel()
+      ticker = undefined
+    }
 
     if (e.agentId === undefined && !e.isAborted) {
       void afterTurn($).catch(() => undefined)
